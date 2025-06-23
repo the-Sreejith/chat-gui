@@ -7,17 +7,19 @@ import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
-import { 
-  Send, 
-  Bot, 
-  User, 
+import {
+  Send,
+  Bot,
+  User,
   Loader2,
   Copy,
   Check,
   Edit3,
   Trash2,
   MoreHorizontal,
-  Sparkles
+  Sparkles,
+  Square,
+  AlertCircle
 } from 'lucide-react';
 import {
   DropdownMenu,
@@ -60,14 +62,25 @@ interface EnhancedChatInterfaceProps {
   onNewMessage?: () => void;
 }
 
+interface StreamingState {
+  isStreaming: boolean;
+  content: string;
+  error?: string;
+  metadata?: any;
+}
+
 export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedChatInterfaceProps) {
   const [message, setMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [messages, setMessages] = useState<Message[]>(conversation?.messages || []);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string>('');
-  const [isTyping, setIsTyping] = useState(false);
-  
+  const [streamingState, setStreamingState] = useState<StreamingState>({
+    isStreaming: false,
+    content: '',
+  });
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
+
   const { data: session } = useSession();
   const { toast } = useToast();
   const router = useRouter();
@@ -80,21 +93,72 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, streamingState.content]);
+
+  // Auto-resize textarea function
+  const adjustTextareaHeight = () => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      // Reset height to auto to get the correct scrollHeight
+      textarea.style.height = 'auto';
+
+      // Calculate the new height
+      const scrollHeight = textarea.scrollHeight;
+      const minHeight = 60; // min-h-[60px]
+      const maxHeight = 200; // max-h-[200px]
+
+      // Set the height within bounds
+      const newHeight = Math.min(Math.max(scrollHeight, minHeight), maxHeight);
+      textarea.style.height = `${newHeight}px`;
+    }
+  };
+
+  // Handle message change and auto-resize
+  const handleMessageChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setMessage(e.target.value);
+    // Use setTimeout to ensure the DOM is updated before calculating height
+    setTimeout(adjustTextareaHeight, 0);
+  };
+
+  // Adjust height on mount and when message changes
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [message]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const stopGeneration = () => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
+      setIsLoading(false);
+      setStreamingState({ isStreaming: false, content: '' });
+
+      toast({
+        title: 'Generation stopped',
+        description: 'The AI response generation has been cancelled.',
+      });
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     if (!message.trim() || isLoading) return;
 
     const userMessage = message.trim();
     setMessage('');
     setIsLoading(true);
-    setIsTyping(true);
+    setStreamingState({ isStreaming: true, content: '' });
+
+    // Reset textarea height after clearing message
+    setTimeout(adjustTextareaHeight, 0);
+
+    // Create abort controller for this request
+    const controller = new AbortController();
+    setAbortController(controller);
 
     // Add user message to UI immediately
     const tempUserMessage: Message = {
@@ -103,11 +167,11 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
       content: userMessage,
       createdAt: new Date().toISOString(),
     };
-    
+
     setMessages(prev => [...prev, tempUserMessage]);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -117,6 +181,7 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
           conversationId: conversation?.id,
           modelId: selectedModelId,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -124,34 +189,124 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
         throw new Error(errorData.error || 'Failed to send message');
       }
 
-      const data = await response.json();
-      
-      // Remove temp user message and add both real messages
-      setMessages(prev => {
-        const withoutTemp = prev.filter(msg => msg.id !== tempUserMessage.id);
-        return [
-          ...withoutTemp,
-          {
-            id: 'user-' + Date.now(),
-            role: 'USER',
-            content: userMessage,
-            createdAt: new Date().toISOString(),
-          },
-          data.message
-        ];
-      });
-
-      // If this is a new conversation, redirect to it
-      if (!conversation?.id && data.conversationId) {
-        router.push(`/chat/${data.conversationId}`);
+      // Handle streaming response
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('No response body');
       }
 
-      onNewMessage?.();
-      
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let streamContent = '';
+      let finalMessageData: any = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') {
+              setStreamingState({ isStreaming: false, content: '' });
+              break;
+            }
+
+            try {
+              const parsed = JSON.parse(data);
+
+              if (parsed.type === 'start') {
+                setStreamingState(prev => ({
+                  ...prev,
+                  metadata: parsed
+                }));
+              } else if (parsed.type === 'content') {
+                if (parsed.delta) {
+                  streamContent += parsed.delta;
+                } else {
+                  streamContent = parsed.content;
+                }
+                setStreamingState(prev => ({
+                  ...prev,
+                  content: streamContent
+                }));
+              } else if (parsed.type === 'complete') {
+                // Stream completion verification
+                console.log('✅ Stream completed successfully:', {
+                  tokens: parsed.totalTokens,
+                  cost: parsed.cost,
+                });
+              } else if (parsed.type === 'done') {
+                finalMessageData = parsed;
+
+                // Remove temp user message and add both real messages
+                setMessages(prev => {
+                  const withoutTemp = prev.filter(msg => msg.id !== tempUserMessage.id);
+                  return [
+                    ...withoutTemp,
+                    {
+                      id: 'user-' + Date.now(),
+                      role: 'USER',
+                      content: userMessage,
+                      createdAt: new Date().toISOString(),
+                    },
+                    {
+                      id: 'assistant-' + Date.now(),
+                      role: 'ASSISTANT',
+                      content: streamContent,
+                      createdAt: new Date().toISOString(),
+                      inputTokens: parsed.usage?.inputTokens,
+                      outputTokens: parsed.usage?.outputTokens,
+                      cost: parsed.usage?.cost,
+                      model: {
+                        id: selectedModelId,
+                        modelName: parsed.usage?.model || 'Unknown',
+                        provider: {
+                          displayName: parsed.usage?.provider || 'Unknown',
+                        },
+                      },
+                    }
+                  ];
+                });
+
+                // If this is a new conversation, redirect to it
+                if (!conversation?.id && parsed.conversationId) {
+                  router.push(`/chat/${parsed.conversationId}`);
+                }
+
+                onNewMessage?.();
+                setStreamingState({ isStreaming: false, content: '' });
+              } else if (parsed.type === 'error') {
+                throw new Error(parsed.error);
+              }
+            } catch (e) {
+              console.warn('Failed to parse streaming JSON:', data);
+            }
+          }
+        }
+      }
+
     } catch (error: any) {
+      if (error.name === 'AbortError') {
+        // Request was aborted, clean up
+        setMessages(prev => prev.filter(msg => msg.id !== tempUserMessage.id));
+        setStreamingState({ isStreaming: false, content: '' });
+        return;
+      }
+
       // Remove temp message on error
       setMessages(prev => prev.filter(msg => msg.id !== tempUserMessage.id));
-      
+
+      setStreamingState({
+        isStreaming: false,
+        content: '',
+        error: error.message
+      });
+
       toast({
         title: 'Error',
         description: error.message,
@@ -159,7 +314,7 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
       });
     } finally {
       setIsLoading(false);
-      setIsTyping(false);
+      setAbortController(null);
     }
   };
 
@@ -186,7 +341,7 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
 
   const formatTokenCount = (inputTokens?: number, outputTokens?: number) => {
     if (!inputTokens && !outputTokens) return null;
-    
+
     const total = (inputTokens || 0) + (outputTokens || 0);
     if (inputTokens && outputTokens) {
       return `${inputTokens}→${outputTokens} (${total})`;
@@ -198,12 +353,10 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
     <div className="flex flex-col h-full bg-gradient-to-br from-purple-50 via-white to-pink-50">
       {/* Header */}
       <div className="border-b bg-white/80 backdrop-blur-sm p-4">
-        <div className="max-w-4xl mx-auto">
-          <ModelSelector
-            selectedModelId={selectedModelId}
-            onModelChange={setSelectedModelId}
-          />
-        </div>
+        <ModelSelector
+          selectedModelId={selectedModelId}
+          onModelChange={setSelectedModelId}
+        />
       </div>
 
       {/* Messages */}
@@ -268,7 +421,7 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                       </AvatarFallback>
                     </Avatar>
                   )}
-                  
+
                   <div
                     className={cn(
                       "max-w-[85%] space-y-2",
@@ -286,15 +439,15 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                       {msg.role === 'USER' ? (
                         <div className="whitespace-pre-wrap text-white">{msg.content}</div>
                       ) : (
-                        <MarkdownMessage 
-                          content={msg.content} 
+                        <MarkdownMessage
+                          content={msg.content}
                           className={cn(
                             "prose-headings:text-gray-900 prose-p:text-gray-700 prose-li:text-gray-700",
                             "prose-code:bg-gray-100 prose-code:text-gray-800"
                           )}
                         />
                       )}
-                      
+
                       {msg.role === 'ASSISTANT' && (
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
@@ -329,10 +482,10 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                         </DropdownMenu>
                       )}
                     </div>
-                    
+
                     <div className="flex items-center gap-2 text-xs text-gray-500 px-1">
                       <span>{format(new Date(msg.createdAt), 'HH:mm')}</span>
-                      
+
                       {msg.role === 'ASSISTANT' && (
                         <>
                           {msg.model && (
@@ -340,14 +493,14 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                               {msg.model.provider.displayName}
                             </Badge>
                           )}
-                          
+
                           {(msg.inputTokens || msg.outputTokens) && (
                             <span className="flex items-center gap-1">
                               <span>🔢</span>
                               {formatTokenCount(msg.inputTokens, msg.outputTokens)}
                             </span>
                           )}
-                          
+
                           {msg.cost && (
                             <span className="flex items-center gap-1">
                               <span>💰</span>
@@ -358,7 +511,7 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                       )}
                     </div>
                   </div>
-                  
+
                   {msg.role === 'USER' && (
                     <Avatar className="w-8 h-8 mt-1 ring-2 ring-purple-100">
                       <AvatarImage src={session?.user?.image || ''} />
@@ -369,23 +522,47 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
                   )}
                 </div>
               ))}
-              
-              {isTyping && (
+
+              {/* Streaming Response */}
+              {streamingState.isStreaming && (
                 <div className="flex gap-4">
                   <Avatar className="w-8 h-8 mt-1 ring-2 ring-purple-100">
                     <AvatarFallback className="bg-gradient-to-r from-purple-500 to-pink-500 text-white">
                       <Bot className="h-4 w-4" />
                     </AvatarFallback>
                   </Avatar>
-                  <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3 shadow-sm">
-                    <div className="flex items-center gap-1">
-                      <div className="flex space-x-1">
-                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                  <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3 shadow-sm max-w-[85%]">
+                    {streamingState.content ? (
+                      <MarkdownMessage
+                        content={streamingState.content}
+                        className="prose-headings:text-gray-900 prose-p:text-gray-700 prose-li:text-gray-700 prose-code:bg-gray-100 prose-code:text-gray-800"
+                      />
+                    ) : (
+                      <div className="flex items-center gap-1">
+                        <div className="flex space-x-1">
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                        </div>
+                        <span className="text-sm text-gray-500 ml-2">AI is thinking...</span>
                       </div>
-                      <span className="text-sm text-gray-500 ml-2">AI is thinking...</span>
-                    </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Error Display */}
+              {streamingState.error && (
+                <div className="flex gap-4">
+                  <Avatar className="w-8 h-8 mt-1 ring-2 ring-red-100">
+                    <AvatarFallback className="bg-red-500 text-white">
+                      <AlertCircle className="h-4 w-4" />
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="bg-red-50 border border-red-200 rounded-2xl px-4 py-3 shadow-sm max-w-[85%]">
+                    <p className="text-red-700 text-sm">
+                      <strong>Error:</strong> {streamingState.error}
+                    </p>
                   </div>
                 </div>
               )}
@@ -403,28 +580,53 @@ export function EnhancedChatInterface({ conversation, onNewMessage }: EnhancedCh
               <Textarea
                 ref={textareaRef}
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={handleMessageChange}
                 onKeyDown={handleKeyDown}
                 placeholder="Ask something..."
-                className="min-h-[60px] max-h-[200px] resize-none pr-12 border-gray-200 focus:border-purple-300 focus:ring-purple-200 rounded-xl"
+                className="resize-none pr-20 border-gray-200 focus:border-purple-300 focus:ring-purple-200 rounded-xl overflow-hidden"
+                style={{
+                  minHeight: '60px',
+                  maxHeight: '200px',
+                  height: '60px' // Initial height
+                }}
                 disabled={isLoading}
+                rows={1}
               />
-              <Button
-                type="submit"
-                size="sm"
-                disabled={!message.trim() || isLoading}
-                className="absolute right-2 bottom-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white border-0 rounded-lg"
-              >
-                {isLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Send className="h-4 w-4" />
+              <div className="absolute right-2 bottom-2 flex gap-1">
+                {isLoading && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={stopGeneration}
+                    className="h-8 w-8 p-0 hover:bg-red-50 hover:border-red-200"
+                    title="Stop generation"
+                  >
+                    <Square className="h-3 w-3 text-red-500" />
+                  </Button>
                 )}
-              </Button>
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={!message.trim() || isLoading}
+                  className="bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white border-0 rounded-lg h-8 w-8 p-0"
+                >
+                  {isLoading ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Send className="h-3 w-3" />
+                  )}
+                </Button>
+              </div>
             </div>
           </form>
           <div className="text-xs text-gray-500 mt-2 text-center">
             Press Enter to send, Shift+Enter for new line
+            {isLoading && (
+              <span className="ml-2 text-purple-600">
+                • Streaming response in real-time
+              </span>
+            )}
           </div>
         </div>
       </div>

@@ -5,13 +5,17 @@ import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Input } from '@/components/ui/input';
 import { 
   MessageSquare, 
   Plus, 
   Trash2, 
   Settings,
   LogOut,
-  User
+  User,
+  Edit3,
+  Check,
+  X
 } from 'lucide-react';
 import { signOut, useSession } from 'next-auth/react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
@@ -43,6 +47,8 @@ interface ChatSidebarProps {
 export function ChatSidebar({ currentConversationId, onNewChat, className }: ChatSidebarProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
   const { data: session } = useSession();
   const router = useRouter();
   const { toast } = useToast();
@@ -97,6 +103,67 @@ export function ChatSidebar({ currentConversationId, onNewChat, className }: Cha
     }
   };
 
+  const startEditing = (conversation: Conversation, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setEditingId(conversation.id);
+    setEditTitle(conversation.title);
+  };
+
+  const cancelEditing = () => {
+    setEditingId(null);
+    setEditTitle('');
+  };
+
+  const saveTitle = async (conversationId: string) => {
+    if (!editTitle.trim()) {
+      cancelEditing();
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/rename`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ title: editTitle.trim() }),
+      });
+
+      if (response.ok) {
+        setConversations(prev => 
+          prev.map(conv => 
+            conv.id === conversationId 
+              ? { ...conv, title: editTitle.trim() }
+              : conv
+          )
+        );
+        
+        toast({
+          title: 'Success',
+          description: 'Conversation renamed successfully.',
+        });
+      } else {
+        throw new Error('Failed to rename conversation');
+      }
+    } catch (error) {
+      toast({
+        title: 'Error',
+        description: 'Failed to rename conversation.',
+        variant: 'destructive',
+      });
+    } finally {
+      cancelEditing();
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent, conversationId: string) => {
+    if (e.key === 'Enter') {
+      saveTitle(conversationId);
+    } else if (e.key === 'Escape') {
+      cancelEditing();
+    }
+  };
+
   const handleSignOut = () => {
     signOut({ callbackUrl: '/' });
   };
@@ -134,27 +201,71 @@ export function ChatSidebar({ currentConversationId, onNewChat, className }: Cha
                   "group flex items-center justify-between p-3 rounded-md cursor-pointer hover:bg-gray-800 transition-colors",
                   currentConversationId === conversation.id && "bg-gray-800"
                 )}
-                onClick={() => router.push(`/chat/${conversation.id}`)}
+                onClick={() => !editingId && router.push(`/chat/${conversation.id}`)}
               >
                 <div className="flex items-center min-w-0 flex-1">
                   <MessageSquare className="mr-2 h-4 w-4 text-gray-400 flex-shrink-0" />
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium truncate">
-                      {conversation.title}
-                    </div>
-                    <div className="text-xs text-gray-400">
-                      {conversation._count.messages} messages
-                    </div>
+                    {editingId === conversation.id ? (
+                      <div className="flex items-center gap-1">
+                        <Input
+                          value={editTitle}
+                          onChange={(e) => setEditTitle(e.target.value)}
+                          onKeyDown={(e) => handleKeyDown(e, conversation.id)}
+                          className="h-6 text-sm bg-gray-700 border-gray-600 text-white"
+                          autoFocus
+                          onBlur={() => saveTitle(conversation.id)}
+                        />
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 p-0 text-green-400 hover:text-green-300"
+                          onClick={() => saveTitle(conversation.id)}
+                        >
+                          <Check className="h-3 w-3" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 p-0 text-red-400 hover:text-red-300"
+                          onClick={cancelEditing}
+                        >
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="text-sm font-medium truncate">
+                          {conversation.title}
+                        </div>
+                        <div className="text-xs text-gray-400">
+                          {conversation._count.messages} messages
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="opacity-0 group-hover:opacity-100 h-6 w-6 p-0 text-gray-400 hover:text-red-400"
-                  onClick={(e) => handleDeleteConversation(conversation.id, e)}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </Button>
+                
+                {editingId !== conversation.id && (
+                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 w-6 p-0 text-gray-400 hover:text-blue-400"
+                      onClick={(e) => startEditing(conversation, e)}
+                    >
+                      <Edit3 className="h-3 w-3" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 w-6 p-0 text-gray-400 hover:text-red-400"
+                      onClick={(e) => handleDeleteConversation(conversation.id, e)}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </div>
+                )}
               </div>
             ))
           )}

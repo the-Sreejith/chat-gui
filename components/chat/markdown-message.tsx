@@ -14,6 +14,14 @@ interface MarkdownMessageProps {
   className?: string;
 }
 
+interface CodeProps {
+  node?: any;
+  inline?: boolean;
+  className?: string;
+  children?: React.ReactNode;
+  [key: string]: any;
+}
+
 export function MarkdownMessage({ content, className }: MarkdownMessageProps) {
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
@@ -32,7 +40,7 @@ export function MarkdownMessage({ content, className }: MarkdownMessageProps) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          code({ node, inline, className, children, ...props }) {
+          code({ node, inline, className, children, ...props }: CodeProps) {
             const match = /language-(\w+)/.exec(className || '');
             const language = match ? match[1] : '';
             const codeString = String(children).replace(/\n$/, '');
